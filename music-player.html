@@ -296,6 +296,22 @@ body {
   padding: 40px;
 }
 #empty-state .icon { font-size: 48px; opacity: 0.3; }
+#auto-scan-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-radius: var(--radius-sm);
+  background: var(--card2);
+  box-shadow: inset 2px 2px 6px var(--neumorph-dark), inset -1px -1px 3px var(--neumorph-light);
+  font-size: 11px; color: var(--text2);
+}
+#auto-scan-bar .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #555; transition: background 0.3s;
+}
+#auto-scan-bar .dot.active { background: #4f6; box-shadow: 0 0 8px #4f6; }
+#auto-scan-bar button {
+  margin-left: auto; background: none; border: none; color: var(--text2);
+  cursor: pointer; font-size: 11px; padding: 2px 6px;
+}
 
 /* ========================== Responsive ========================== */
 @media (max-width: 900px) {
@@ -340,6 +356,11 @@ body {
       <div style="display:flex;gap:8px;">
         <button class="nm-btn ctrl-btn-sm" onclick="toggleShuffle()" id="btn-shuffle" title="随机播放">🔀</button>
         <button class="nm-btn ctrl-btn-sm" onclick="toggleRepeat()" id="btn-repeat" title="列表循环">🔁</button>
+      </div>
+      <div id="auto-scan-bar">
+        <span class="dot" id="auto-scan-dot"></span>
+        <span id="auto-scan-text">自动扫描: 关闭</span>
+        <button onclick="toggleAutoScan()" id="auto-scan-btn" style="color:var(--accent2)">开启</button>
       </div>
     </div>
     <div id="folder-tree"><div style="padding:8px;color:var(--text2);font-size:12px;">暂无文件夹</div></div>
@@ -660,22 +681,157 @@ drawVisualizer();
 // ==================== Library Manager ====================
 const audioExts = new Set(['mp3','wav','flac','ogg','m4a','aac','wma','opus','webm']);
 let allTracks = [];
+let storedDirHandle = null;
+let autoScanInterval = null;
+let autoScanOn = false;
+let lastScanTime = 0;
 
-async function scanFolder() {
+// ---- IndexedDB for dir handle ----
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('neumusic', 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore('handles'); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveDirHandle(handle) {
   try {
-    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    const db = await openIDB();
+    const tx = db.transaction('handles', 'readwrite');
+    tx.objectStore('handles').put(handle, 'dir');
+    await new Promise(r => { tx.oncomplete = r; tx.onerror = r; });
+    db.close();
+  } catch(e) { /* IndexedDB not available */ }
+}
+
+async function loadDirHandle() {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction('handles', 'readonly');
+    const req = tx.objectStore('handles').get('dir');
+    const handle = await new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return handle || null;
+  } catch(e) { return null; }
+}
+
+// ---- Scan ----
+async function scanFolder(handle) {
+  try {
+    if (!handle) {
+      handle = await window.showDirectoryPicker({ mode: 'read' });
+    }
+    storedDirHandle = handle;
+    await saveDirHandle(handle);
+    lastScanTime = Date.now();
     toast('🔍 正在扫描文件夹...');
     const files = [];
-    await scanDir(dirHandle, files, '');
+    await scanDir(handle, files, '');
     await processFiles(files);
+    updateAutoScanUI();
     toast(`✅ 已加载 ${files.length} 首歌曲`);
+    if (!playlist.length) filterTracks();
   } catch(e) {
     if (e.name !== 'AbortError') {
-      toast('⚠️ 浏览器不支持或已取消');
+      toast('⚠️ 浏览器不支持或已取消，请用文件选择');
       document.getElementById('file-input').click();
     }
   }
 }
+
+async function refreshScan() {
+  if (!storedDirHandle) return;
+  try {
+    // Re-verify permission
+    const perm = await storedDirHandle.queryPermission({ mode: 'read' });
+    if (perm !== 'granted') {
+      const req = await storedDirHandle.requestPermission({ mode: 'read' });
+      if (req !== 'granted') { toast('⚠️ 需要文件夹权限'); return; }
+    }
+    const files = [];
+    await scanDir(storedDirHandle, files, '');
+    if (files.length > 0) {
+      await processFiles(files);
+      lastScanTime = Date.now();
+      updateAutoScanUI();
+    }
+  } catch(e) { /* ignore */ }
+}
+
+// ---- Auto Scan ----
+async function toggleAutoScan() {
+  if (autoScanOn) {
+    stopAutoScan();
+  } else {
+    if (!storedDirHandle) {
+      // Try loading from IDB
+      storedDirHandle = await loadDirHandle();
+      if (!storedDirHandle) {
+        toast('⚠️ 请先扫描一个音乐文件夹');
+        return;
+      }
+    }
+    startAutoScan();
+  }
+}
+
+function startAutoScan() {
+  autoScanOn = true;
+  updateAutoScanUI();
+  toast('🔄 自动扫描已开启 (每30秒)');
+  // Initial scan
+  refreshScan();
+  // Poll every 30 seconds
+  autoScanInterval = setInterval(async () => {
+    updateAutoScanUI();
+    await refreshScan();
+  }, 30000);
+}
+
+function stopAutoScan() {
+  autoScanOn = false;
+  if (autoScanInterval) { clearInterval(autoScanInterval); autoScanInterval = null; }
+  updateAutoScanUI();
+  toast('⏸ 自动扫描已关闭');
+}
+
+function updateAutoScanUI() {
+  const dot = document.getElementById('auto-scan-dot');
+  const text = document.getElementById('auto-scan-text');
+  const btn = document.getElementById('auto-scan-btn');
+  if (autoScanOn) {
+    dot.classList.add('active');
+    text.textContent = `自动扫描: 开启 · ${new Date(lastScanTime).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`;
+    btn.textContent = '关闭';
+  } else {
+    dot.classList.remove('active');
+    text.textContent = '自动扫描: 关闭';
+    btn.textContent = '开启';
+  }
+}
+
+// ---- Init: restore handle & auto-scan on page load ----
+(async function initAutoScan() {
+  storedDirHandle = await loadDirHandle();
+  if (storedDirHandle) {
+    try {
+      const perm = await storedDirHandle.queryPermission({ mode: 'read' });
+      if (perm === 'granted') {
+        await scanFolder(storedDirHandle);
+        // Auto-resume auto-scan if folder handle exists
+        startAutoScan();
+      } else {
+        updateAutoScanUI();
+        toast('💡 已记住文件夹，点击扫描恢复');
+      }
+    } catch(e) { /* handle expired */ }
+  }
+})();
 
 async function scanDir(dirHandle, files, prefix) {
   for await (const [name, entry] of dirHandle.entries()) {
