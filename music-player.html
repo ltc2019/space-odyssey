@@ -502,13 +502,18 @@ function readLatin1(arr, off, len) {
 }
 
 // ==================== Audio Engine ====================
-const audio = new Audio();
-let audioCtx, analyser, sourceNode;
+const audio = new Audio();       // current track
+const audioNext = new Audio();   // pre-buffered next track
+let audioCtx, analyser, sourceNode, gainNode, gainNextNode;
 let playlist = [], currentIdx = -1, isPlaying = false;
 let shuffleOn = false, repeatOn = false;
 let favorites = new Set();
 let volume = 0.7;
-audio.volume = volume;
+let crossfadeDuration = 4; // seconds of overlap
+let nextPreloaded = false;
+let crossfading = false;
+audio.volume = 0; // controlled via gainNode
+audioNext.volume = 0;
 
 function initAudioCtx() {
   if (!audioCtx) {
@@ -516,14 +521,29 @@ function initAudioCtx() {
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.8;
+
+    // Main track chain
     sourceNode = audioCtx.createMediaElementSource(audio);
-    sourceNode.connect(analyser);
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 1;
+    sourceNode.connect(gainNode);
+    gainNode.connect(analyser);
+
+    // Next track chain (for crossfade)
+    const sourceNext = audioCtx.createMediaElementSource(audioNext);
+    gainNextNode = audioCtx.createGain();
+    gainNextNode.gain.value = 0;
+    sourceNext.connect(gainNextNode);
+    gainNextNode.connect(analyser);
+
     analyser.connect(audioCtx.destination);
   }
 }
 
 function loadTrack(idx) {
   if (idx < 0 || idx >= playlist.length) return;
+  crossfading = false;
+  nextPreloaded = false;
   currentIdx = idx;
   const t = playlist[idx];
   if (t.blobUrl) URL.revokeObjectURL(t.blobUrl);
@@ -531,16 +551,95 @@ function loadTrack(idx) {
   audio.src = t.blobUrl;
   audio.load();
   initAudioCtx();
+  // Reset gains
+  if (gainNode) gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+  if (gainNextNode) gainNextNode.gain.setValueAtTime(0, audioCtx.currentTime);
   updatePlayerUI();
   if (isPlaying) audio.play().catch(() => {});
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: t.title,
-      artist: t.artist,
+      title: t.title, artist: t.artist,
       album: t.album || 'Neumusic',
       artwork: [{ src: t.coverUrl || '', sizes: '300x300', type: 'image/jpeg' }]
     });
   }
+  // Pre-load next track in background
+  preloadNext();
+}
+
+function preloadNext() {
+  if (crossfading || playlist.length < 2) return;
+  let nextIdx;
+  if (shuffleOn) {
+    nextIdx = Math.floor(Math.random() * playlist.length);
+  } else {
+    nextIdx = (currentIdx + 1) % playlist.length;
+  }
+  if (nextIdx === currentIdx) return;
+  const nt = playlist[nextIdx];
+  if (nt._preloadUrl) URL.revokeObjectURL(nt._preloadUrl);
+  nt._preloadUrl = URL.createObjectURL(nt.file);
+  audioNext.src = nt._preloadUrl;
+  audioNext.load();
+  nextPreloaded = true;
+}
+
+function crossfadeToNext() {
+  if (!nextPreloaded || crossfading || !audioCtx || !gainNode || !gainNextNode) return;
+  crossfading = true;
+  const t = audioCtx.currentTime;
+  gainNode.gain.setValueAtTime(1, t);
+  gainNode.gain.linearRampToValueAtTime(0, t + crossfadeDuration);
+  gainNextNode.gain.setValueAtTime(0, t);
+  gainNextNode.gain.linearRampToValueAtTime(1, t + crossfadeDuration);
+
+  // Start next audio
+  audioNext.currentTime = 0;
+  audioNext.play().catch(() => {});
+
+  // After crossfade, swap
+  const swapDelay = (crossfadeDuration + 0.2) * 1000;
+  clearTimeout(window._crossfadeTimer);
+  window._crossfadeTimer = setTimeout(() => {
+    // Advance index
+    let nextIdx;
+    if (shuffleOn) {
+      nextIdx = Math.floor(Math.random() * playlist.length);
+    } else {
+      nextIdx = (currentIdx + 1) % playlist.length;
+    }
+    // Swap: copy next audio's blobUrl to main audio
+    const nt = playlist[nextIdx];
+    if (nt._preloadUrl) {
+      if (playlist[currentIdx]?.blobUrl) URL.revokeObjectURL(playlist[currentIdx].blobUrl);
+      playlist[currentIdx].blobUrl = null;
+    }
+    currentIdx = nextIdx;
+    const t = playlist[currentIdx];
+    if (t._preloadUrl) {
+      t.blobUrl = t._preloadUrl;
+      t._preloadUrl = null;
+    }
+    audio.src = t.blobUrl || '';
+    audio.currentTime = audioNext.currentTime;
+    // Reset gains
+    gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+    gainNextNode.gain.setValueAtTime(0, audioCtx.currentTime);
+    audioNext.pause();
+    audioNext.src = '';
+    crossfading = false;
+    nextPreloaded = false;
+    updatePlayerUI();
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: t.title, artist: t.artist,
+        album: t.album || 'Neumusic',
+        artwork: [{ src: t.coverUrl || '', sizes: '300x300', type: 'image/jpeg' }]
+      });
+    }
+    preloadNext();
+    renderPlaylist();
+  }, swapDelay);
 }
 
 function togglePlay() {
@@ -549,7 +648,12 @@ function togglePlay() {
   if (currentIdx < 0) loadTrack(0);
   if (isPlaying) {
     audio.pause();
+    audioNext.pause();
     isPlaying = false;
+    crossfading = false;
+    if (gainNode) gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+    if (gainNextNode) gainNextNode.gain.setValueAtTime(0, audioCtx.currentTime);
+    clearTimeout(window._crossfadeTimer);
   } else {
     audio.play().catch(() => {});
     isPlaying = true;
@@ -559,7 +663,11 @@ function togglePlay() {
 
 function nextTrack() {
   if (!playlist.length) return;
-  let next = currentIdx;
+  if (nextPreloaded && isPlaying && !crossfading) {
+    crossfadeToNext();
+    return;
+  }
+  let next;
   if (shuffleOn) {
     next = Math.floor(Math.random() * playlist.length);
   } else {
@@ -567,24 +675,30 @@ function nextTrack() {
   }
   loadTrack(next);
   if (isPlaying) audio.play().catch(() => {});
+  renderPlaylist();
 }
 
 function prevTrack() {
   if (!playlist.length) return;
-  let prev = currentIdx;
   if (audio.currentTime > 3) {
     audio.currentTime = 0;
     return;
   }
-  prev = (currentIdx - 1 + playlist.length) % playlist.length;
+  crossfading = false;
+  clearTimeout(window._crossfadeTimer);
+  if (gainNode) gainNode.gain.setValueAtTime(1, audioCtx.currentTime);
+  if (gainNextNode) gainNextNode.gain.setValueAtTime(0, audioCtx.currentTime);
+  let prev = (currentIdx - 1 + playlist.length) % playlist.length;
   loadTrack(prev);
   if (isPlaying) audio.play().catch(() => {});
+  renderPlaylist();
 }
 
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
   document.getElementById('btn-shuffle').style.color = shuffleOn ? 'var(--accent2)' : 'var(--text)';
   toast(shuffleOn ? '🔀 随机播放开启' : '🔀 随机播放关闭');
+  if (isPlaying) preloadNext();
 }
 
 function toggleRepeat() {
@@ -594,7 +708,8 @@ function toggleRepeat() {
 }
 
 function setVolume(v) {
-  volume = v; audio.volume = v;
+  volume = v;
+  if (gainNode) gainNode.gain.setValueAtTime(v, audioCtx.currentTime);
 }
 
 function seekTo(fraction) {
@@ -608,6 +723,12 @@ audio.addEventListener('timeupdate', () => {
   const pct = audio.currentTime / audio.duration;
   document.getElementById('progress-bar').value = Math.round(pct * 1000);
   document.getElementById('time-cur').textContent = fmtTime(audio.currentTime);
+
+  // Auto-trigger crossfade when < crossfadeDuration remaining
+  const remaining = audio.duration - audio.currentTime;
+  if (isPlaying && !crossfading && nextPreloaded && remaining < crossfadeDuration && remaining > 0.2) {
+    crossfadeToNext();
+  }
 });
 
 audio.addEventListener('loadedmetadata', () => {
@@ -620,7 +741,8 @@ audio.addEventListener('ended', () => {
     audio.currentTime = 0;
     audio.play().catch(() => {});
   } else {
-    nextTrack();
+    // If crossfade happened, the track already switched — just ensure it keeps going
+    if (!crossfading) nextTrack();
   }
 });
 
@@ -732,10 +854,15 @@ async function scanFolder(handle) {
     toast('🔍 正在扫描文件夹...');
     const files = [];
     await scanDir(handle, files, '');
-    await processFiles(files);
+    const newCount = await processFiles(files);
     updateAutoScanUI();
     toast(`✅ 已加载 ${files.length} 首歌曲`);
     if (!playlist.length) filterTracks();
+    // Auto-play on first scan
+    if (newCount > 0 && !isPlaying) {
+      if (currentIdx < 0) loadTrack(0);
+      audio.play().then(() => { isPlaying = true; updatePlayerUI(); }).catch(() => {});
+    }
   } catch(e) {
     if (e.name !== 'AbortError') {
       toast('⚠️ 浏览器不支持或已取消，请用文件选择');
@@ -816,6 +943,9 @@ function updateAutoScanUI() {
 }
 
 // ---- Init: restore handle & auto-scan on page load ----
+let userInteracted = false;
+document.addEventListener('click', () => { userInteracted = true; }, { once: true });
+
 (async function initAutoScan() {
   storedDirHandle = await loadDirHandle();
   if (storedDirHandle) {
@@ -823,11 +953,21 @@ function updateAutoScanUI() {
       const perm = await storedDirHandle.queryPermission({ mode: 'read' });
       if (perm === 'granted') {
         await scanFolder(storedDirHandle);
-        // Auto-resume auto-scan if folder handle exists
         startAutoScan();
+        // Auto-play after library loads
+        if (playlist.length > 0 && currentIdx < 0) {
+          loadTrack(0);
+          audio.play().then(() => {
+            isPlaying = true;
+            updatePlayerUI();
+            toast('🚀 全自动播放中 · 无缝切歌');
+          }).catch(() => {
+            toast('👆 点击任意位置开始自动播放');
+          });
+        }
       } else {
         updateAutoScanUI();
-        toast('💡 已记住文件夹，点击扫描恢复');
+        toast('💡 已记住文件夹，点击任意位置恢复');
       }
     } catch(e) { /* handle expired */ }
   }
@@ -908,12 +1048,19 @@ async function processFilesDirect(tracks) {
 
   // Merge: don't duplicate
   const existing = new Set(allTracks.map(t => t.path));
+  let newCount = 0;
   for (const r of results) {
-    if (!existing.has(r.path)) allTracks.push(r);
+    if (!existing.has(r.path)) { allTracks.push(r); newCount++; }
   }
   updateStats();
   renderPlaylist();
   if (!playlist.length) filterTracks();
+  // Auto-play: if was idle, start playing
+  if (!isPlaying && playlist.length > 0) {
+    if (currentIdx < 0 || currentIdx >= playlist.length) loadTrack(0);
+    audio.play().then(() => { isPlaying = true; updatePlayerUI(); }).catch(() => {});
+  }
+  return newCount;
 }
 
 function updateStats() {
